@@ -1,9 +1,11 @@
 ﻿namespace SmartJsonGenerator.Core.Abstractions.ValueGenerators;
 
+/// <summary>Generates random date and time values for <see cref="DateTime"/>, <see cref="DateTimeOffset"/>, <see cref="DateOnly"/>, <see cref="TimeOnly"/>, and <see cref="TimeSpan"/>.</summary>
 public class DateTimeValueGenerator : IValueGenerator
 {
     private readonly Random _random = Random.Shared;
 
+    /// <inheritdoc />
     public bool CanHandle(Type propertyType, string propertyName)
         => propertyType == typeof(DateTime)
            || propertyType == typeof(DateTimeOffset)
@@ -11,6 +13,7 @@ public class DateTimeValueGenerator : IValueGenerator
            || propertyType == typeof(TimeOnly)
            || propertyType == typeof(TimeSpan);
 
+    /// <inheritdoc />
     public object? GenerateValue(Type propertyType, string propertyName)
     {
         var daysOffset = _random.Next(-3650, 3650);

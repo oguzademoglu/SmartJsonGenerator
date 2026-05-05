@@ -2,41 +2,58 @@
 using SmartJsonGenerator.Core.Configuration;
 using System.Buffers;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace SmartJsonGenerator.Core.Core;
 
+/// <summary>
+/// Core implementation of <see cref="ISmartJsonGenerator"/>.
+/// Generates populated object graphs and serializes them to JSON using
+/// Expression-tree-compiled delegates to avoid raw reflection in hot paths.
+/// </summary>
 public class SmartGenerator : ISmartJsonGenerator
 {
     private readonly IMetaDataCache _cache;
-    private readonly IEnumerable<IValueGenerator> _valueGenerators;
+    private readonly IValueGenerator[] _valueGenerators;
     private readonly SmartJsonOptions _options;
 
-    public SmartGenerator(IMetaDataCache cahce, IEnumerable<IValueGenerator>? valueGenerators = null,
+    // Caches the resolved generator per Type (null = no generator handles this type).
+    // TryGetValue returns true even when the stored value is null, enabling O(1) negative caching.
+    private readonly ConcurrentDictionary<Type, IValueGenerator?> _generatorCache = new();
+
+    /// <summary>
+    /// Initializes a new <see cref="SmartGenerator"/> instance.
+    /// </summary>
+    /// <param name="cache">Metadata cache that stores pre-compiled type information.</param>
+    /// <param name="valueGenerators">Optional set of leaf-value generators (string, numeric, DateTime…).</param>
+    /// <param name="options">Generation options such as max depth and collection size.</param>
+    public SmartGenerator(IMetaDataCache cache, IEnumerable<IValueGenerator>? valueGenerators = null,
         SmartJsonOptions? options = null)
     {
-        _cache = cahce;
-        _valueGenerators = valueGenerators ?? new List<IValueGenerator>();
+        _cache = cache;
+        _valueGenerators = (valueGenerators ?? []).ToArray();
         _options = options ?? new SmartJsonOptions();
     }
 
+    /// <inheritdoc />
     public string GenerateJson<T>()
     {
         var instance = Generate<T>();
         return JsonSerializer.Serialize(instance);
     }
 
-    public string GenerateJson<T>(int count = 1)
+    /// <inheritdoc />
+    public string GenerateJson<T>(int count)
     {
-        var options = new JsonWriterOptions { Indented = true };
+        var writerOptions = new JsonWriterOptions { Indented = true };
         var output = new ArrayBufferWriter<byte>();
-        using var writer = new Utf8JsonWriter(output, options);
+        using var writer = new Utf8JsonWriter(output, writerOptions);
 
         if (count > 1) writer.WriteStartArray();
 
         for (int i = 0; i < count; i++)
         {
-            // Nesneyi üret ve doğrudan writer'a serialize et
             var instance = Generate<T>();
             JsonSerializer.Serialize(writer, instance);
         }
@@ -47,21 +64,21 @@ public class SmartGenerator : ISmartJsonGenerator
         return System.Text.Encoding.UTF8.GetString(output.WrittenSpan);
     }
 
+    /// <inheritdoc />
     public T Generate<T>()
     {
-        // Instance değil, Type bazlı takip (Backtracking için)
         var typeStack = new HashSet<Type>();
-        return (T)GenerateInternal(typeof(T), 0, typeStack);
+        return (T)GenerateInternal(typeof(T), 0, typeStack)!;
     }
 
+    /// <inheritdoc />
     public IEnumerable<T> GenerateMany<T>(int count)
     {
         for (int i = 0; i < count; i++)
-        {
             yield return Generate<T>();
-        }
     }
 
+    /// <inheritdoc />
     public async IAsyncEnumerable<T> GenerateManyAsync<T>(int count,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken = default)
@@ -69,48 +86,69 @@ public class SmartGenerator : ISmartJsonGenerator
         for (int i = 0; i < count; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            // Asenkron akışta CPU bound işlemi blocklamamak için Task.Run kullanılabilir 
-            // ancak şimdilik memory-friendly IAsyncEnumerable patternini kuruyoruz.
             yield return Generate<T>();
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Hot-path generator lookup — result cached per Type in ConcurrentDictionary.
+    // Linear scan of _valueGenerators runs only on the first encounter of each type.
+    // -------------------------------------------------------------------------
+
+    private IValueGenerator? FindGenerator(Type type)
+    {
+        if (_generatorCache.TryGetValue(type, out var cached))
+            return cached;
+
+        IValueGenerator? found = null;
+        for (int i = 0; i < _valueGenerators.Length; i++)
+        {
+            if (_valueGenerators[i].CanHandle(type, string.Empty))
+            {
+                found = _valueGenerators[i];
+                break;
+            }
+        }
+
+        // TryAdd is safe under concurrency; a duplicate add from another thread is harmless.
+        _generatorCache.TryAdd(type, found);
+        return found;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection handler — passes the SAME typeStack reference (no copies).
+    // Each element's recursive call manages its own backtracking internally.
+    // -------------------------------------------------------------------------
 
     private bool TryGenerateCollection(Type type, int depth, HashSet<Type> typeStack, out object? result)
     {
         result = null;
 
-        // 1. String bir IEnumerable'dır ama biz onu koleksiyon olarak işlemeyiz.
+        // string implements IEnumerable but is not a collection.
         if (type == typeof(string)) return false;
 
-        // 2. Array Kontrolü (T[])
         if (type.IsArray)
         {
             var elementType = type.GetElementType()!;
-            var count = _options.DefaultCollectionSize; // Config'den gelmeli (örn: 3)
+            var count = _options.DefaultCollectionSize;
             var array = Array.CreateInstance(elementType, count);
 
             for (int i = 0; i < count; i++)
-            {
-                var item = GenerateInternal(elementType, depth + 1, new HashSet<Type>(typeStack));
-                array.SetValue(item, i);
-            }
+                array.SetValue(GenerateInternal(elementType, depth + 1, typeStack), i);
 
             result = array;
             return true;
         }
 
-        // 3. Dictionary Kontrolü (IDictionary<K, V>)
         if (type.IsGenericType && typeof(IDictionary).IsAssignableFrom(type))
         {
-            var keyType = type.GetGenericArguments()[0];
-            var valueType = type.GetGenericArguments()[1];
+            var genericArgs = type.GetGenericArguments();
             var dict = (IDictionary)Activator.CreateInstance(type)!;
 
             for (int i = 0; i < _options.DefaultCollectionSize; i++)
             {
-                var k = GenerateInternal(keyType, depth + 1, new HashSet<Type>(typeStack));
-                var v = GenerateInternal(valueType, depth + 1, new HashSet<Type>(typeStack));
+                var k = GenerateInternal(genericArgs[0], depth + 1, typeStack);
+                var v = GenerateInternal(genericArgs[1], depth + 1, typeStack);
                 if (k != null) dict.Add(k, v);
             }
 
@@ -118,19 +156,14 @@ public class SmartGenerator : ISmartJsonGenerator
             return true;
         }
 
-        // 4. List / IEnumerable Kontrolü (List<T>, ICollection<T>)
         if (type.IsGenericType && typeof(IEnumerable).IsAssignableFrom(type))
         {
             var elementType = type.GetGenericArguments()[0];
-            // Somut bir tip oluştur (List<T>)
             var listType = typeof(List<>).MakeGenericType(elementType);
             var list = (IList)Activator.CreateInstance(listType)!;
 
             for (int i = 0; i < _options.DefaultCollectionSize; i++)
-            {
-                var item = GenerateInternal(elementType, depth + 1, new HashSet<Type>(typeStack));
-                list.Add(item);
-            }
+                list.Add(GenerateInternal(elementType, depth + 1, typeStack));
 
             result = list;
             return true;
@@ -139,80 +172,94 @@ public class SmartGenerator : ISmartJsonGenerator
         return false;
     }
 
-    // Özyinelemeli (Recursive) ana fonksiyon
-    private object? GenerateInternal(Type type, int depth, HashSet<Type> typeStack, Type? containerType = null,
-        string? propertyName = null)
+    // -------------------------------------------------------------------------
+    // Recursive core — single HashSet<Type> reference flows through the entire
+    // call tree. Backtracking (try-finally-remove) keeps the stack clean even
+    // when exceptions occur, preventing false circular-reference detections on
+    // subsequent calls within the same Generate<T>() session.
+    // -------------------------------------------------------------------------
+
+    private object? GenerateInternal(Type type, int depth, HashSet<Type> typeStack,
+        Type? containerType = null, string? propertyName = null)
     {
         if (depth > _options.MaxDepth) return null;
 
+        // Custom rule override (fluent API)
         if (containerType != null && propertyName != null &&
-            _options.Rules.TryGetValue(containerType, out var typeConfig))
+            _options.Rules.TryGetValue(containerType, out var typeConfig) &&
+            typeConfig.PropertyRules.TryGetValue(propertyName, out var customFactory))
         {
-            if (typeConfig.PropertyRules.TryGetValue(propertyName, out var customFactory))
-            {
-                return customFactory();
-            }
+            return customFactory();
         }
 
-        // 1. Önce primitive/basit değer üreticilerini kontrol et (String, Int vs.)
-        var generator = _valueGenerators.FirstOrDefault(g => g.CanHandle(type, string.Empty));
+        // Primitive / leaf types: resolved via O(1) cached lookup
+        var generator = FindGenerator(type);
         if (generator != null)
-        {
-            return generator.GenerateValue(type, string.Empty);
-        }
+            return generator.GenerateValue(type, propertyName ?? string.Empty);
 
-        // collection types
+        // Collection types: array, dictionary, list
         if (TryGenerateCollection(type, depth, typeStack, out var collectionResult))
-        {
             return collectionResult;
-        }
 
-        // 2. Döngüsel Referans Kontrolü (Type-based)
+        // Circular reference guard — value types (int, Guid, struct…) are never
+        // added to the stack: they cannot form circular references and the overhead
+        // would cause false positives.
+        bool addedToStack = false;
         if (!type.IsValueType && type != typeof(string))
         {
-            if (typeStack.Contains(type)) return null; // Aynı dalda aynı tip üretilemez
+            if (typeStack.Contains(type)) return null;
             typeStack.Add(type);
+            addedToStack = true;
         }
 
         var metadata = _cache.GetOrAdd(type);
         object? instance;
 
-        // 3. Nesne Yaratma
         try
         {
-            if (metadata.BestConstructor != null && metadata.ConstructorParameters.Count > 0)
+            // Instantiation via Expression-tree-compiled delegates (no raw reflection)
+            if (metadata.CompiledConstructor != null)
             {
-                var args = metadata.ConstructorParameters
-                    .Select(p => GenerateInternal(p.ParameterType, depth + 1, new HashSet<Type>(typeStack),
-                        type, p.LinkedPropertyName))
-                    .ToArray();
-                instance = metadata.BestConstructor.Invoke(args);
+                var args = new object?[metadata.ConstructorParameters.Count];
+                for (int i = 0; i < metadata.ConstructorParameters.Count; i++)
+                {
+                    var p = metadata.ConstructorParameters[i];
+                    args[i] = GenerateInternal(p.ParameterType, depth + 1, typeStack, type, p.LinkedPropertyName);
+                }
+                instance = metadata.CompiledConstructor(args);
+            }
+            else if (metadata.CompiledParameterlessConstructor != null)
+            {
+                instance = metadata.CompiledParameterlessConstructor();
             }
             else
             {
-                instance = Activator.CreateInstance(type);
+                // Abstract type or interface — nothing to instantiate.
+                return null;
             }
+
+            // Property population — O(1) HashSet lookup replaces LINQ Any() in the loop
+            foreach (var prop in metadata.WritableProperties)
+            {
+                if (metadata.ConstructorLinkedProperties.Contains(prop.Name)) continue;
+
+                var value = GenerateInternal(prop.PropertyType, depth + 1, typeStack, type, prop.Name);
+                prop.Setter(instance, value);
+            }
+
+            return instance;
         }
         catch
         {
+            // Abstract types, interfaces, or exotic constructors — return null gracefully.
             return null;
-        } // Instantiation fails for abstract/interfaces
-
-        // 4. Property Doldurma
-        foreach (var prop in metadata.WritableProperties)
-        {
-            // Constructor'da zaten atanmış olma ihtimalini kontrol et (LinkedPropertyName)
-            if (metadata.ConstructorParameters.Any(p => p.LinkedPropertyName == prop.Name))
-                continue;
-
-            var value = GenerateInternal(prop.PropertyType, depth + 1, new HashSet<Type>(typeStack), type, prop.Name);
-            prop.Setter.Invoke(instance!, value);
         }
-
-        // Backtracking: Bu dal bittiğinde tipi stack'ten çıkarabiliriz (Opsiyonel)
-        // typeStack.Remove(type); 
-
-        return instance;
+        finally
+        {
+            // Backtracking: always remove the type we added, even if an exception occurred.
+            // This guarantees the shared typeStack is never left in a dirty state.
+            if (addedToStack)
+                typeStack.Remove(type);
+        }
     }
 }
-

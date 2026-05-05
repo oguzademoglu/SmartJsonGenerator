@@ -14,6 +14,7 @@ public class CustomRuleGenerator : IValueGenerator
     private static readonly string[] Countries  = ["Turkey", "United States", "Germany", "France", "United Kingdom"];
     private static readonly string[] Cities     = ["Istanbul", "Ankara", "New York", "Berlin", "Paris", "London"];
 
+    /// <inheritdoc />
     public bool CanHandle(Type propertyType, string propertyName)
         => propertyType == typeof(bool)
         || propertyType == typeof(Guid)
@@ -21,6 +22,7 @@ public class CustomRuleGenerator : IValueGenerator
         || propertyType.IsEnum
         || IsNamedStringProperty(propertyType, propertyName);
 
+    /// <inheritdoc />
     public object? GenerateValue(Type propertyType, string propertyName)
     {
         if (propertyType == typeof(bool)) return _random.Next(2) == 1;

@@ -1,0 +1,20 @@
+# Smart JSON Generator Project Rules
+
+## Core Principles
+- **Performance First:** Minimize heap allocations. Use `Span<T>`, `Memory<T>`, and `ArrayPool<T>` in hot paths.
+- **AOT Readiness:** Ensure all code is compatible with Native AOT. Avoid dynamic assembly loading.
+- **Modern C# Standards:** Use C# 12/13/14 features: Primary Constructors, `field` keyword, `params collections`, and `file-scoped namespaces`.
+
+## Technical Constraints
+- **Reflection vs. Expressions:** Strictly forbid raw `PropertyInfo.SetValue/GetValue` in loops. Use `Expression Trees` to compile and cache delegates (Func/Action).
+- **JSON Streaming:** Use `Utf8JsonWriter` for all JSON generation to maintain a low memory footprint.
+- **Circular References:** Use a single `HashSet<Type>` with a **Backtracking** (Try-Finally-Remove) approach for recursive depth management.
+
+## Project Structure
+- Abstractions: `SmartJsonGenerator.Core.Abstractions`
+- Core Engine: `SmartJsonGenerator.Core.Core`
+- Caching: `SmartJsonGenerator.Core.Caching` (Thread-safe, ConcurrentDictionary)
+
+## Formatting & Documentation
+- Use XML Documentation for all public APIs.
+- Follow "Clean Code" principles: Methods should be concise and focused.

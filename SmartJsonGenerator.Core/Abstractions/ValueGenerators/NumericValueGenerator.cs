@@ -1,9 +1,11 @@
 ﻿namespace SmartJsonGenerator.Core.Abstractions.ValueGenerators;
 
+/// <summary>Generates random numeric values for all built-in numeric types.</summary>
 public class NumericValueGenerator : IValueGenerator
 {
     private readonly Random _random = Random.Shared;
 
+    /// <inheritdoc />
     public bool CanHandle(Type propertyType, string propertyName)
         => propertyType == typeof(int)
         || propertyType == typeof(long)
@@ -13,6 +15,7 @@ public class NumericValueGenerator : IValueGenerator
         || propertyType == typeof(double)
         || propertyType == typeof(decimal);
 
+    /// <inheritdoc />
     public object? GenerateValue(Type propertyType, string propertyName)
     {
         if (propertyType == typeof(int))     return _random.Next(1, 1000);

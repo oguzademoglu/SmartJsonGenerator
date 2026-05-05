@@ -1,9 +1,116 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- ====================================================================
+       Target Frameworks
+       ==================================================================== -->
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
   </PropertyGroup>
+
+  <!-- ====================================================================
+       NuGet Package Identity & Metadata
+       ==================================================================== -->
+  <PropertyGroup>
+    <PackageId>SmartJsonGenerator</PackageId>
+    <Version>1.0.0-beta</Version>
+    <Authors>Oğuz Ademoğlu</Authors>
+    <Company>oguzademoglu</Company>
+    <Product>SmartJsonGenerator</Product>
+    <Description>
+      A high-performance, allocation-minimized fake JSON data generator for .NET.
+      Uses Expression Trees to compile property setters and constructors once,
+      then generates arbitrarily complex object graphs with backtracking-based
+      circular-reference protection and full Utf8JsonWriter streaming support.
+    </Description>
+    <PackageTags>json;fake-data;test-data;codegen;expression-trees;utf8;dotnet</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/oguzademoglu/SmartJsonGenerator</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/oguzademoglu/SmartJsonGenerator.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright © 2026 Oğuz Ade Moğlu</Copyright>
+  </PropertyGroup>
+
+  <!-- ====================================================================
+       SourceLink & Debugging (snupkg symbol package)
+       ==================================================================== -->
+  <PropertyGroup>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <!-- ====================================================================
+       Deterministic Builds
+       Activated automatically when the CI environment variable is set
+       (GitHub Actions, Azure DevOps, etc. set CI=true by default).
+       ==================================================================== -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <!-- ====================================================================
+       Performance & Deployment (Trimming / AOT)
+
+       SmartGenerator is fundamentally reflection-driven: it discovers
+       constructors and properties at runtime, then compiles Expression
+       Tree delegates for them.  This means it cannot be made fully
+       trim-safe or Native AOT-compatible without a source-generator
+       rewrite.
+
+       IsAotCompatible/IsTrimmable are set to true so that the MSBuild
+       analyzers run and surface issues — useful while the library
+       evolves toward a source-generator path.  The IL warnings below
+       are suppressed because each violation is architectural (by design)
+       and not an accidental oversight:
+
+         IL3050 — Expression.Compile() requires dynamic code (intentional)
+         IL2026 — JsonSerializer generic overloads need unreferenced-code
+                  access (will be addressed with JsonTypeInfo overloads)
+         IL2067 — Activator.CreateInstance in collection helpers
+         IL2070 — Type.GetConstructors / GetProperties reflection calls
+       ==================================================================== -->
+  <PropertyGroup>
+    <IsTrimmable>true</IsTrimmable>
+    <IsAotCompatible>true</IsAotCompatible>
+    <NoWarn>$(NoWarn);IL3050;IL2026;IL2067;IL2070</NoWarn>
+    <!-- System.IO.Hashing (transitive SourceLink dep, preview) only declares net10.0 support.
+         Safe to suppress: SourceLink is a build-time tool and does not ship with the library. -->
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+  </PropertyGroup>
+
+  <!-- ====================================================================
+       Code Quality & Analysis
+       ==================================================================== -->
+  <PropertyGroup>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- ====================================================================
+       Package Content: icon + README
+       ==================================================================== -->
+  <ItemGroup>
+    <None Include="icon.png" Pack="true" PackagePath="\" />
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- ====================================================================
+       Dependencies
+       ==================================================================== -->
+  <ItemGroup>
+    <!-- PrivateAssets=all: SourceLink is a build-time tool; not shipped to consumers -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="11.0.100-preview.3.26207.106">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
 
 </Project>

@@ -3,131 +3,163 @@ using System.Collections.Concurrent;
 using System.Linq.Expressions;
 using System.Reflection;
 
-
 namespace SmartJsonGenerator.Core.Caching;
 
+/// <summary>
+/// Thread-safe, process-lifetime cache of pre-compiled type metadata.
+/// Each <see cref="TypeMetadata"/> entry is built once via Expression Trees and reused for all subsequent calls.
+/// </summary>
 public class ConcurrentMetadataCache : IMetaDataCache
 {
     private readonly ConcurrentDictionary<Type, TypeMetadata> _cache = new();
 
-    public TypeMetadata GetOrAdd(Type type)
+    /// <inheritdoc />
+    public TypeMetadata GetOrAdd(Type type) => _cache.GetOrAdd(type, BuildMetadata);
+
+    // -------------------------------------------------------------------------
+    // Core builder — called once per type, result is cached forever.
+    // -------------------------------------------------------------------------
+
+    private static TypeMetadata BuildMetadata(Type type)
     {
-        return _cache.GetOrAdd(type, t =>
-        {
-            // 1. En uygun constructor'ı bul (En çok parametresi olan)
-            var ctor = t.GetConstructors()
-                .OrderByDescending(c => c.GetParameters().Length)
-                .FirstOrDefault() ?? throw new Exception($"{t.Name} has no constructor!");
-
-            var ctorParams = ctor.GetParameters().Select(p => new ParameterMetadata(
-                p.Name!,
-                p.ParameterType,
-                GetMatchingPropertyName(t, p.Name!)
-            )).ToList();
-
-            // 2. Yazılabilir property'leri ayıkla (Init-only dahil)
-            var props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Select(CreatePropertyMetadata)
-                .ToList();
-
-            bool isImmutable = t.GetCustomAttributes().Any(a => a.GetType().Name == "IsReadOnlyAttribute")
-                               || ctorParams.Count > 0;
-
-            return new TypeMetadata(t, isImmutable, ctor, ctorParams, props);
-        });
-    }
-
-    private string GetMatchingPropertyName(Type t, string paramName)
-    {
-        // Parameter: "firstName" -> Property: "FirstName" eşleştirmesi
-        return t.GetProperties().FirstOrDefault(p =>
-            p.Name.Equals(paramName, StringComparison.OrdinalIgnoreCase))?.Name ?? paramName;
-    }
-
-    private TypeMetadata CreateMetadata(Type type)
-    {
-        // 1. En uygun (en çok parametreli) constructor'ı seç
-        var bestCtor = type.GetConstructors()
+        // 1. Best constructor: prefer the one with the most parameters (record / immutable friendly)
+        var ctor = type.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
             .OrderByDescending(c => c.GetParameters().Length)
             .FirstOrDefault();
 
-        if (bestCtor == null && !type.IsValueType)
-            throw new InvalidOperationException($"{type.Name} tipinin uygun bir constructor'ı bulunamadı.");
+        // 2. Map constructor parameters to their matching public property names
+        var ctorParams = ctor?.GetParameters()
+            .Select(p => new ParameterMetadata(
+                p.Name!,
+                p.ParameterType,
+                ResolveLinkedPropertyName(type, p.Name!)))
+            .ToList() ?? [];
 
-        // 2. Constructor parametrelerini haritala
-        var ctorParams = bestCtor?.GetParameters().Select(p => new ParameterMetadata(
-            p.Name!,
-            p.ParameterType,
-            GetMatchingPropertyName(type, p.Name!) // Parametre adını property ile eşleştir
-        )).ToList() ?? new List<ParameterMetadata>();
+        // 3. O(1) lookup set — avoids per-property LINQ Any() in the hot path
+        var linkedProps = new HashSet<string>(
+            ctorParams.Select(p => p.LinkedPropertyName),
+            StringComparer.Ordinal);
 
-        // 3. Yazılabilir property'leri bul
-        var properties = type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+        // 4. Writable properties (CanWrite covers both regular and init-only setters)
+        var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.CanWrite)
             .Select(CreatePropertyMetadata)
             .ToList();
 
-        // 4. Immutable/Record tespiti (Basit kontrol: Parametreli constructor varsa immutable dostu kabul et)
+        // 5. Compile constructor delegates — executed once, then cached
+        Func<object?[], object>? compiledCtor = null;
+        Func<object>? compiledParamlessCtor = null;
+
+        if (ctor != null && ctorParams.Count > 0)
+            compiledCtor = CompileParameterizedConstructor(ctor);
+        else if (ctor != null)
+            compiledParamlessCtor = CompileParameterlessConstructor(ctor);
+        else if (type.IsValueType)
+            compiledParamlessCtor = CompileValueTypeFactory(type);
+
         bool isImmutable = ctorParams.Count > 0 ||
                            type.GetCustomAttributes().Any(a => a.GetType().Name == "IsReadOnlyAttribute");
 
         return new TypeMetadata(
             Type: type,
             IsRecordOrImmutable: isImmutable,
-            BestConstructor: bestCtor!,
+            BestConstructor: ctor,
             ConstructorParameters: ctorParams,
-            WritableProperties: properties
+            WritableProperties: props,
+            ConstructorLinkedProperties: linkedProps,
+            CompiledConstructor: compiledCtor,
+            CompiledParameterlessConstructor: compiledParamlessCtor
         );
     }
 
-    private static Func<object> CompileConstructor(Type type)
-    {
-        // Value Type (struct) veya parametresiz constructor'ı olmayan sınıflar için fallback
-        var ctor = type.GetConstructor(Type.EmptyTypes);
-        if (ctor == null)
-        {
-            return type.IsValueType
-                ? () => Activator.CreateInstance(type)! // Struct'lar için zorunlu activator
-                : throw new InvalidOperationException($"'{type.Name}' has no parameterless constructor.");
-        }
+    // -------------------------------------------------------------------------
+    // Expression Tree compilers
+    // -------------------------------------------------------------------------
 
-        var newExp = Expression.New(ctor);
-        return Expression.Lambda<Func<object>>(newExp).Compile();
+    /// <summary>
+    /// Compiles: <c>(object?[] args) => (object)new T((T0)args[0], (T1)args[1], ...)</c>
+    /// </summary>
+    private static Func<object?[], object> CompileParameterizedConstructor(ConstructorInfo ctor)
+    {
+        var argsParam = Expression.Parameter(typeof(object?[]), "args");
+
+        var ctorArgExpressions = ctor.GetParameters()
+            .Select((p, i) => (Expression)Expression.Convert(
+                Expression.ArrayIndex(argsParam, Expression.Constant(i)),
+                p.ParameterType))
+            .ToArray();
+
+        var newExpr = Expression.New(ctor, ctorArgExpressions);
+        var body = Expression.Convert(newExpr, typeof(object));
+        return Expression.Lambda<Func<object?[], object>>(body, argsParam).Compile();
     }
 
-    private IPropertyMetadata CreatePropertyMetadata(PropertyInfo propertyInfo)
+    /// <summary>
+    /// Compiles: <c>() => (object)new T()</c>
+    /// </summary>
+    private static Func<object> CompileParameterlessConstructor(ConstructorInfo ctor)
+    {
+        var newExpr = Expression.New(ctor);
+        var body = Expression.Convert(newExpr, typeof(object));
+        return Expression.Lambda<Func<object>>(body).Compile();
+    }
+
+    /// <summary>
+    /// Compiles: <c>() => (object)default(T)</c> — for value types (structs) with no explicit constructor.
+    /// </summary>
+    private static Func<object> CompileValueTypeFactory(Type type)
+    {
+        var defaultExpr = Expression.Default(type);
+        var body = Expression.Convert(defaultExpr, typeof(object));
+        return Expression.Lambda<Func<object>>(body).Compile();
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Maps a constructor parameter name to its corresponding public property name (case-insensitive).
+    /// e.g. "firstName" → "FirstName"
+    /// </summary>
+    private static string ResolveLinkedPropertyName(Type type, string paramName)
+    {
+        return type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .FirstOrDefault(p => p.Name.Equals(paramName, StringComparison.OrdinalIgnoreCase))
+            ?.Name ?? paramName;
+    }
+
+    private static IPropertyMetadata CreatePropertyMetadata(PropertyInfo prop)
     {
         return new PropertyMetadata
         {
-            Name = propertyInfo.Name,
-            PropertyType = propertyInfo.PropertyType,
-            Setter = CompileSetter(propertyInfo)
+            Name = prop.Name,
+            PropertyType = prop.PropertyType,
+            Setter = CompileSetter(prop)
         };
     }
 
-    private static Action<object, object?> CompileSetter(PropertyInfo propertyInfo)
+    /// <summary>
+    /// Compiles: <c>(object target, object? value) => ((TOwner)target).Property = (TProperty)value</c>
+    /// Expression Trees bypass the C# compiler's init-only restriction at the IL level.
+    /// </summary>
+    private static Action<object, object?> CompileSetter(PropertyInfo prop)
     {
-        var targetExp = Expression.Parameter(typeof(object), "target");
-        var valueExp = Expression.Parameter(typeof(object), "value");
+        var targetParam = Expression.Parameter(typeof(object), "target");
+        var valueParam = Expression.Parameter(typeof(object), "value");
 
-        // ((TTarget)target)
-        var castTargetExp = Expression.Convert(targetExp, propertyInfo.DeclaringType!);
+        var castTarget = Expression.Convert(targetParam, prop.DeclaringType!);
+        var castValue = Expression.Convert(valueParam, prop.PropertyType);
+        var propertyAccess = Expression.Property(castTarget, prop);
+        var assign = Expression.Assign(propertyAccess, castValue);
 
-        // ((TProperty)value) - unboxing / cast
-        var castValueExp = Expression.Convert(valueExp, propertyInfo.PropertyType);
-
-        // target.Property = value
-        var propertyAccessExp = Expression.Property(castTargetExp, propertyInfo);
-        var assignExp = Expression.Assign(propertyAccessExp, castValueExp);
-
-        return Expression.Lambda<Action<object, object?>>(assignExp, targetExp, valueExp).Compile();
+        return Expression.Lambda<Action<object, object?>>(assign, targetParam, valueParam).Compile();
     }
 
-    // İç kullanım için immutable record
-    private record PropertyMetadata : IPropertyMetadata
+    private sealed record PropertyMetadata : IPropertyMetadata
     {
         public required string Name { get; init; }
         public required Type PropertyType { get; init; }
         public required Action<object, object?> Setter { get; init; }
     }
 }
-
