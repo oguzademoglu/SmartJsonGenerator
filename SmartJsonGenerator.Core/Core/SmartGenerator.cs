@@ -18,10 +18,6 @@ public class SmartGenerator : ISmartJsonGenerator
     private readonly IValueGenerator[] _valueGenerators;
     private readonly SmartJsonOptions _options;
 
-    // Caches the resolved generator per Type (null = no generator handles this type).
-    // TryGetValue returns true even when the stored value is null, enabling O(1) negative caching.
-    private readonly ConcurrentDictionary<Type, IValueGenerator?> _generatorCache = new();
-
     /// <summary>
     /// Initializes a new <see cref="SmartGenerator"/> instance.
     /// </summary>
@@ -91,27 +87,39 @@ public class SmartGenerator : ISmartJsonGenerator
     }
 
     // -------------------------------------------------------------------------
-    // Hot-path generator lookup — result cached per Type in ConcurrentDictionary.
-    // Linear scan of _valueGenerators runs only on the first encounter of each type.
+    // Hot-path generator lookup — cached by (Type, propertyName).
+    //
+    // Cache key strategy:
+    //   • For non-string types, CanHandle never depends on the property name,
+    //     so we normalise the key to (type, "") — one cache entry per type.
+    //   • For string, the name CAN influence which generator wins
+    //     (e.g. CustomRuleGenerator handles "Email" but not "Notes"),
+    //     so we key by (typeof(string), actualPropertyName).
+    //
+    // This keeps the cache bounded (one entry per unique property name seen)
+    // while enabling semantic generation for named string properties.
     // -------------------------------------------------------------------------
 
-    private IValueGenerator? FindGenerator(Type type)
+    private readonly ConcurrentDictionary<(Type, string), IValueGenerator?> _generatorCache = new();
+
+    private IValueGenerator? FindGenerator(Type type, string propertyName)
     {
-        if (_generatorCache.TryGetValue(type, out var cached))
+        var key = (type, type == typeof(string) ? propertyName : string.Empty);
+
+        if (_generatorCache.TryGetValue(key, out var cached))
             return cached;
 
         IValueGenerator? found = null;
         for (int i = 0; i < _valueGenerators.Length; i++)
         {
-            if (_valueGenerators[i].CanHandle(type, string.Empty))
+            if (_valueGenerators[i].CanHandle(type, propertyName))
             {
                 found = _valueGenerators[i];
                 break;
             }
         }
 
-        // TryAdd is safe under concurrency; a duplicate add from another thread is harmless.
-        _generatorCache.TryAdd(type, found);
+        _generatorCache.TryAdd(key, found);
         return found;
     }
 
@@ -202,9 +210,10 @@ public class SmartGenerator : ISmartJsonGenerator
         // Primitive / leaf types are resolved before the depth check.
         // Depth limits exist to prevent runaway *structural* recursion (deep object graphs),
         // not to suppress simple scalars that happen to live at a deep nesting level.
-        var generator = FindGenerator(type);
+        var resolvedName = propertyName ?? string.Empty;
+        var generator = FindGenerator(type, resolvedName);
         if (generator != null)
-            return generator.GenerateValue(type, propertyName ?? string.Empty);
+            return generator.GenerateValue(type, resolvedName);
 
         // Depth guard — only applied to complex types and collections.
         if (depth > _options.MaxDepth) return null;

@@ -19,13 +19,16 @@ public class SmartGeneratorTests
         _options = new SmartJsonOptions();
         var cache = new ConcurrentMetadataCache();
 
-        // Default generatorları manuel enjekte ediyoruz (Pure DI)
+        // Generator kayıt sırası önemlidir: en spesifik önce, en genel fallback sona.
+        // CustomRuleGenerator, isim bazlı string tespiti (Email, City, Name…) yaptığından
+        // StringValueGenerator'dan ÖNCE gelmeli; aksi hâlde string tipi için her zaman
+        // StringValueGenerator kazanır ve semantic üretim devre dışı kalır.
         var generators = new List<IValueGenerator>
         {
-            new NumericValueGenerator(),
-            new StringValueGenerator(),
-            new DateTimeValueGenerator(),
-            new CustomRuleGenerator()
+            new CustomRuleGenerator(),   // email / city / name / phone… (spesifik)
+            new NumericValueGenerator(), // int / long / decimal…
+            new DateTimeValueGenerator(), // DateTime / DateOnly / TimeSpan…
+            new StringValueGenerator()   // generic fallback — her string'i üretir
         };
 
         _sut = new SmartGenerator(cache, generators, _options);
@@ -141,6 +144,41 @@ public class SmartGeneratorTests
     }
 
     [Fact]
+    public void GenerateJson_Company_200_WriteToFile()
+    {
+        var options = new SmartJsonOptions { DefaultCollectionSize = 2 };
+
+        string[] brands    = ["Acme Corp", "Globex", "Initech", "Umbrella Ltd", "Stark Industries", "Wayne Enterprises", "Dunder Mifflin", "Vandelay Industries"];
+        string[] deptNames = ["Engineering", "Marketing", "Sales", "HR", "Finance", "Operations", "R&D", "Customer Success"];
+        string[] streets   = ["Baker Street", "Fifth Avenue", "Elm Street", "Sunset Blvd", "Wall Street", "Broadway", "Main Street", "Park Lane"];
+        string[] domains   = ["corp.com", "ltd.io", "inc.co", "global.org", "tech.net"];
+
+        options.GlobalNamingRules["BrandName"] = () => brands[Random.Shared.Next(brands.Length)];
+        options.GlobalNamingRules["Name"]      = () => deptNames[Random.Shared.Next(deptNames.Length)];
+        options.GlobalNamingRules["Email"]     = () =>
+        {
+            string[] first = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "hank", "iris", "jake"];
+            string[] last  = ["smith", "jones", "brown", "taylor", "white", "harris", "clark"];
+            return $"{first[Random.Shared.Next(first.Length)]}.{last[Random.Shared.Next(last.Length)]}@{domains[Random.Shared.Next(domains.Length)]}";
+        };
+        options.GlobalNamingRules["Street"] = () => $"{Random.Shared.Next(1, 500)} {streets[Random.Shared.Next(streets.Length)]}";
+
+        var generators = new List<IValueGenerator>
+        {
+            new CustomRuleGenerator(),
+            new NumericValueGenerator(),
+            new DateTimeValueGenerator(),
+            new StringValueGenerator()
+        };
+        var sut = new SmartGenerator(new ConcurrentMetadataCache(), generators, options);
+
+        var json = sut.GenerateJson<Company>(200);
+
+        var path = Path.Combine(Path.GetTempPath(), "companies_200.json");
+        File.WriteAllText(path, json);
+    }
+
+    [Fact]
     public void GenerateJson_Company_200_ShouldProduceValidJsonArray()
     {
         // Arrange — GlobalNamingRules ile anlamlı veriler üret
@@ -155,10 +193,10 @@ public class SmartGeneratorTests
 
         var generators = new List<IValueGenerator>
         {
+            new CustomRuleGenerator(),
             new NumericValueGenerator(),
-            new StringValueGenerator(),
             new DateTimeValueGenerator(),
-            new CustomRuleGenerator()
+            new StringValueGenerator()
         };
         var sut = new SmartGenerator(new ConcurrentMetadataCache(), generators, options);
 
