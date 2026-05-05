@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SmartJsonGenerator.Core/SmartJsonGenerator.Core.csproj" />
+  <Project Path="SmartJsonGenerator.UnitTests/SmartJsonGenerator.UnitTests.csproj" />
+</Solution>
