@@ -184,12 +184,19 @@ public class SmartGenerator : ISmartJsonGenerator
     {
         if (depth > _options.MaxDepth) return null;
 
-        // Custom rule override (fluent API)
+        // Per-type property override (highest priority — fluent RuleFor API)
         if (containerType != null && propertyName != null &&
             _options.Rules.TryGetValue(containerType, out var typeConfig) &&
             typeConfig.PropertyRules.TryGetValue(propertyName, out var customFactory))
         {
             return customFactory();
+        }
+
+        // Global naming rule override (project-wide conventions, case-insensitive key match)
+        if (!string.IsNullOrEmpty(propertyName) &&
+            _options.GlobalNamingRules.TryGetValue(propertyName, out var namingFactory))
+        {
+            return namingFactory();
         }
 
         // Primitive / leaf types: resolved via O(1) cached lookup
@@ -217,16 +224,26 @@ public class SmartGenerator : ISmartJsonGenerator
 
         try
         {
-            // Instantiation via Expression-tree-compiled delegates (no raw reflection)
+            // Instantiation via Expression-tree-compiled delegates (no raw reflection).
+            // ArrayPool reduces heap pressure for the temporary args array; safe because
+            // CompiledConstructor reads all elements before we return the array to the pool.
             if (metadata.CompiledConstructor != null)
             {
-                var args = new object?[metadata.ConstructorParameters.Count];
-                for (int i = 0; i < metadata.ConstructorParameters.Count; i++)
+                var count = metadata.ConstructorParameters.Count;
+                var args = ArrayPool<object?>.Shared.Rent(count);
+                try
                 {
-                    var p = metadata.ConstructorParameters[i];
-                    args[i] = GenerateInternal(p.ParameterType, depth + 1, typeStack, type, p.LinkedPropertyName);
+                    for (int i = 0; i < count; i++)
+                    {
+                        var p = metadata.ConstructorParameters[i];
+                        args[i] = GenerateInternal(p.ParameterType, depth + 1, typeStack, type, p.LinkedPropertyName);
+                    }
+                    instance = metadata.CompiledConstructor(args);
                 }
-                instance = metadata.CompiledConstructor(args);
+                finally
+                {
+                    ArrayPool<object?>.Shared.Return(args, clearArray: true);
+                }
             }
             else if (metadata.CompiledParameterlessConstructor != null)
             {

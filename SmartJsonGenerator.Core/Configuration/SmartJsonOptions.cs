@@ -25,5 +25,18 @@ public record SmartJsonOptions
 
     /// <summary>Per-type property override rules registered via the fluent API.</summary>
     public ConcurrentDictionary<Type, TypeRuleConfiguration> Rules { get; } = new();
+
+    /// <summary>
+    /// Global property-name-based value factories applied across all types.
+    /// Keys are matched case-insensitively against the property name.
+    /// These run after per-type <see cref="Rules"/> overrides but before the built-in
+    /// <c>IValueGenerator</c> pipeline, making them ideal for project-wide conventions.
+    /// <example><code>
+    /// options.GlobalNamingRules["TenantId"] = () => Guid.NewGuid();
+    /// options.GlobalNamingRules["CreatedAt"] = () => DateTime.UtcNow;
+    /// </code></example>
+    /// </summary>
+    public Dictionary<string, Func<object?>> GlobalNamingRules { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
 }
 
