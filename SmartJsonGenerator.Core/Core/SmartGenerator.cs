@@ -182,9 +182,8 @@ public class SmartGenerator : ISmartJsonGenerator
     private object? GenerateInternal(Type type, int depth, HashSet<Type> typeStack,
         Type? containerType = null, string? propertyName = null)
     {
-        if (depth > _options.MaxDepth) return null;
-
-        // Per-type property override (highest priority — fluent RuleFor API)
+        // Per-type property override (highest priority — fluent RuleFor API).
+        // Custom factories are never depth-gated; they are user-controlled.
         if (containerType != null && propertyName != null &&
             _options.Rules.TryGetValue(containerType, out var typeConfig) &&
             typeConfig.PropertyRules.TryGetValue(propertyName, out var customFactory))
@@ -192,17 +191,23 @@ public class SmartGenerator : ISmartJsonGenerator
             return customFactory();
         }
 
-        // Global naming rule override (project-wide conventions, case-insensitive key match)
+        // Global naming rule override (project-wide conventions, case-insensitive key match).
+        // Also not depth-gated — the user opted in explicitly.
         if (!string.IsNullOrEmpty(propertyName) &&
             _options.GlobalNamingRules.TryGetValue(propertyName, out var namingFactory))
         {
             return namingFactory();
         }
 
-        // Primitive / leaf types: resolved via O(1) cached lookup
+        // Primitive / leaf types are resolved before the depth check.
+        // Depth limits exist to prevent runaway *structural* recursion (deep object graphs),
+        // not to suppress simple scalars that happen to live at a deep nesting level.
         var generator = FindGenerator(type);
         if (generator != null)
             return generator.GenerateValue(type, propertyName ?? string.Empty);
+
+        // Depth guard — only applied to complex types and collections.
+        if (depth > _options.MaxDepth) return null;
 
         // Collection types: array, dictionary, list
         if (TryGenerateCollection(type, depth, typeStack, out var collectionResult))
